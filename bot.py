@@ -64,9 +64,9 @@ ADMIN_ROLE_IDS = [int(role_id) for role_id in admin_ids_str.split(",") if role_i
 PRIVATE_CHANNEL_PREFIX = "deepseek-" # 私密频道前缀
 MAX_IMAGE_ATTACHMENTS = int(os.getenv("MAX_IMAGE_ATTACHMENTS", 3)) # 最大图片附件数
 
-# --- DeepSeek API 请求函数 ---
+# --- DeepSeek API 请求函数 (修正版，区分 Reasoner) ---
 async def get_deepseek_response(session, api_key, model, messages):
-    """异步调用 DeepSeek API，可以处理包含图像 URL 的消息"""
+    """异步调用 DeepSeek API，特殊处理 reasoner 模型的思维链"""
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
@@ -74,11 +74,12 @@ async def get_deepseek_response(session, api_key, model, messages):
     payload = {
         "model": model,
         "messages": messages,
-        # 可以根据模型调整 max_tokens, 但 Vision 模型可能需要更大值
-        # "max_tokens": 4096
+        # 注意：根据文档，reasoner 模型不支持 temperature, top_p 等参数
+        # 视觉模型可能需要更大的 max_tokens
+        # "max_tokens": 4096 if AVAILABLE_MODELS.get(model, {}).get("supports_vision") else 2048
     }
     logger.info(f"Sending request to DeepSeek API using model '{model}' with {len(messages)} messages.")
-    # logger.debug(f"Request payload: {json.dumps(payload, indent=2, ensure_ascii=False)}") # 调试时取消注释
+    # logger.debug(f"Request payload: {json.dumps(payload, indent=2, ensure_ascii=False)}")
 
     try:
         async with session.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=300) as response:
@@ -88,21 +89,54 @@ async def get_deepseek_response(session, api_key, model, messages):
                  logger.error(f"Failed JSON decode. Status: {response.status}. Text: {raw_response_text[:500]}...");
                  return None, f"无法解析响应(状态{response.status})"
 
+            # logger.debug(f"Parsed response data: {json.dumps(response_data, indent=2, ensure_ascii=False)}")
+
             if response.status == 200:
                  if response_data.get("choices") and len(response_data["choices"]) > 0:
                     message_data = response_data["choices"][0].get("message", {})
-                    final_content = message_data.get("content") # 主要获取 content
                     usage = response_data.get("usage")
-                    if not final_content: logger.error("API response missing content."); return None, "响应数据不完整。"
-                    logger.info(f"Success. Usage: {usage}")
-                    # 返回显示内容和历史内容（对于非reasoner模型通常相同）
-                    return final_content.strip(), final_content.strip()
-                 else: logger.error(f"API response missing 'choices': {response_data}"); return None, f"意外结构：{response_data}"
-            else:
+
+                    # --- 核心改动：区分处理 ---
+                    reasoning_content = None
+                    final_content = message_data.get("content") # 先获取主要 content
+
+                    # 检查是否是 reasoner 模型，并且响应中确实包含 reasoning_content
+                    if model == "deepseek-reasoner":
+                        reasoning_content = message_data.get("reasoning_content") # 尝试获取思维链
+
+                    # 构建用于 Discord 显示的完整响应字符串
+                    full_response_for_discord = ""
+                    if reasoning_content: # 如果获取到了思维链 (只会在 reasoner 模型时发生)
+                        full_response_for_discord += f"🤔 **思考过程:**\n```\n{reasoning_content.strip()}\n```\n\n"
+
+                    if final_content: # 如果有最终回答内容
+                        # 如果前面有思维链，添加一个前缀，否则直接添加内容
+                        prefix = "💬 **最终回答:**\n" if reasoning_content else ""
+                        full_response_for_discord += f"{prefix}{final_content.strip()}"
+                    elif reasoning_content and not final_content:
+                        # 极端情况：只有思维链没有最终回答，直接显示思维链
+                        full_response_for_discord = reasoning_content.strip()
+                        logger.warning(f"Model '{model}' returned reasoning_content but no final content.")
+
+                    # 检查是否成功构建了任何要显示的响应
+                    if not full_response_for_discord:
+                         logger.error("API response missing expected content (content/reasoning_content).")
+                         return None, "抱歉，API 返回的数据似乎不完整。"
+
+                    logger.info(f"Successfully received response from DeepSeek. Usage: {usage}")
+                    # 返回两个值：
+                    # 1. 用于 Discord 显示的完整字符串 (可能包含思维链)
+                    # 2. 用于历史记录的字符串 (始终只包含最终回答 final_content)
+                    return full_response_for_discord.strip(), final_content.strip() if final_content else None
+                 else: # choices 为空
+                     logger.error(f"API response missing 'choices': {response_data}");
+                     return None, f"意外结构：{response_data}"
+            else: # 处理非 200 错误
                 error_message = response_data.get("error", {}).get("message", f"未知错误(状态{response.status})")
                 logger.error(f"API error (Status {response.status}): {error_message}. Response: {raw_response_text[:500]}")
                 if response.status == 400: error_message += "\n(提示: 400 通常因格式错误或输入无效)"
                 return None, f"API 调用出错 (状态{response.status}): {error_message}"
+    # 处理网络/超时等异常
     except aiohttp.ClientConnectorError as e: logger.error(f"Network error: {e}"); return None, "无法连接 API"
     except asyncio.TimeoutError: logger.error("API request timed out."); return None, "API 连接超时"
     except Exception as e: logger.exception("Unexpected API call error."); return None, f"未知 API 错误: {e}"
@@ -306,6 +340,7 @@ async def on_message(message: discord.Message):
     try:
       async with message.channel.typing():
           async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
+              # 使用全局当前的模型 ID
               response_for_discord, response_for_history = await get_deepseek_response(session, DEEPSEEK_API_KEY, current_model_id, api_messages)
 
       if response_for_discord:
