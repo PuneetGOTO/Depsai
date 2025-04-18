@@ -26,17 +26,22 @@ admin_ids_str = os.getenv("ADMIN_ROLE_IDS", "")
 ADMIN_ROLE_IDS = [int(role_id) for role_id in admin_ids_str.split(",") if role_id.strip().isdigit()]
 PRIVATE_CHANNEL_PREFIX = "deepseek-"
 
-# --- DeepSeek API 请求函数 (保持不变) ---
+# --- DeepSeek API 请求函数 ---
 async def get_deepseek_response(session, api_key, model, messages):
-    # ... (此处省略，使用上一个版本完整的 get_deepseek_response 代码) ...
+    """异步调用 DeepSeek API，处理 reasoning_content 和 content"""
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
-    payload = {"model": model, "messages": messages}
+    payload = {
+        "model": model,
+        "messages": messages,
+    }
+
     logger.info(f"Sending request to DeepSeek API using model '{model}' with {len(messages)} messages.")
+
     try:
-        async with session.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=300) as response: # 增加超时
+        async with session.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=300) as response: # 设置超时
             raw_response_text = await response.text()
             try:
                 response_data = json.loads(raw_response_text)
@@ -68,6 +73,10 @@ async def get_deepseek_response(session, api_key, model, messages):
             else: # 处理错误状态码
                 error_message = response_data.get("error", {}).get("message", f"未知错误 (状态码 {response.status})")
                 logger.error(f"DeepSeek API error (Status {response.status}): {error_message}. Response: {raw_response_text[:500]}")
+                # 特别处理 400 错误提示
+                if response.status == 400:
+                    logger.warning("A 400 error might be caused by including 'reasoning_content' in the input messages.")
+                    error_message += "\n(提示: 错误 400 通常因为请求格式错误，请检查是否意外将思考过程加入到了请求历史中)"
                 return None, f"抱歉，调用 DeepSeek API 时出错 (状态码 {response.status}): {error_message}"
     except aiohttp.ClientConnectorError as e:
         logger.error(f"Network connection error: {e}")
@@ -78,7 +87,6 @@ async def get_deepseek_response(session, api_key, model, messages):
     except Exception as e:
         logger.exception("An unexpected error occurred during DeepSeek API call.")
         return None, f"抱歉，处理 DeepSeek 请求时发生未知错误: {e}"
-
 
 # --- Discord 机器人设置 ---
 intents = discord.Intents.default()
@@ -92,10 +100,7 @@ conversation_history = {}
 
 # --- 创建按钮视图 ---
 class CreateChatView(View):
-    # timeout=None 使视图持久化，按钮在机器人重启后依然有效
-    # 但这需要更复杂的处理（通常结合数据库存储message_id并在启动时重新添加视图）
-    # 为了简单，我们先不设置 timeout=None，按钮将在机器人重启后失效
-    # 如果需要持久化，请取消注释下面这行并实现 add_view 的逻辑
+    # timeout=None # 保持非持久化以简化
     # def __init__(self):
     #    super().__init__(timeout=None)
 
@@ -104,18 +109,17 @@ class CreateChatView(View):
         """按钮被点击时执行的回调函数"""
         guild = interaction.guild
         user = interaction.user
-        bot_member = guild.get_member(bot.user.id) # 在回调中重新获取 bot member
+        bot_member = guild.get_member(bot.user.id)
 
         if not guild:
             await interaction.response.send_message("此操作只能在服务器内进行。", ephemeral=True)
             return
-            
+
         if not bot_member or not bot_member.guild_permissions.manage_channels:
             await interaction.response.send_message("机器人缺少“管理频道”权限，无法创建聊天频道。", ephemeral=True)
             logger.warning(f"Button Click: Missing 'Manage Channels' permission in guild {guild.id}")
             return
 
-        # --- 以下逻辑与之前的 /new_chat 基本相同 ---
         clean_user_name = re.sub(r'[^\w-]', '', user.display_name.replace(' ', '-')).lower()
         if not clean_user_name: clean_user_name = "user"
         channel_name = f"{PRIVATE_CHANNEL_PREFIX}{clean_user_name}-{user.id % 10000}"
@@ -131,16 +135,18 @@ class CreateChatView(View):
                 overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_messages=True, view_channel=True)
 
         try:
-            # 告知用户正在创建 (ephemeral 对按钮点击者可见)
             await interaction.response.send_message(f"正在为你创建私密聊天频道 **{channel_name}** ...", ephemeral=True)
 
             category = discord.utils.find(lambda c: c.name.lower() == "deepseek chats", guild.categories)
             if category and category.permissions_for(bot_member).manage_channels:
                  new_channel = await guild.create_text_channel(channel_name, overwrites=overwrites, category=category)
+                 logger.info(f"Button Click: Created channel {new_channel.name} in category '{category.name}'")
             else:
                  new_channel = await guild.create_text_channel(channel_name, overwrites=overwrites)
+                 if category: logger.warning(f"Found category 'DeepSeek Chats' but lack permissions. Creating in default location.")
+                 else: logger.info("Category 'DeepSeek Chats' not found, creating in default location.")
 
-            logger.info(f"Button Click: Created private channel {new_channel.name} ({new_channel.id}) for user {user.name} ({user.id})")
+            logger.info(f"Successfully created private channel {new_channel.name} ({new_channel.id}) for user {user.name} ({user.id})")
 
             await new_channel.send(
                 f"你好 {user.mention}！\n"
@@ -150,12 +156,11 @@ class CreateChatView(View):
                 f"当你完成后，可以在此频道使用 `/close_chat` 命令来关闭它。"
             )
 
-            # 用 followup 发送频道链接，因为上面已经 response
             await interaction.followup.send(f"你的私密聊天频道已创建：{new_channel.mention}", ephemeral=True)
 
         except discord.Forbidden:
             logger.error(f"Button Click: Permission error (Forbidden) for user {user.id} creating channel '{channel_name}'.")
-            try: await interaction.followup.send("创建频道失败：权限不足。", ephemeral=True)
+            try: await interaction.followup.send("创建频道失败：机器人权限不足。", ephemeral=True)
             except discord.NotFound: pass
         except discord.HTTPException as e:
             logger.error(f"Button Click: HTTP error for user {user.id} creating channel '{channel_name}': {e}")
@@ -166,13 +171,10 @@ class CreateChatView(View):
             try: await interaction.followup.send(f"创建频道时发生未知错误。", ephemeral=True)
             except discord.NotFound: pass
 
-
-# --- setup_hook 同步斜杠命令和打印配置 ---
-# 注意：如果需要持久化视图，需要在这里添加 bot.add_view() 的逻辑
+# --- setup_hook ---
 @bot.event
 async def setup_hook():
     logger.info("Running setup_hook...")
-    # --- 打印配置日志 ---
     logger.info(f'--- Bot Configuration ---')
     logger.info(f'Default/Current DeepSeek Model: {DEEPSEEK_MODEL}')
     logger.info(f'Max Conversation History Turn: {MAX_HISTORY}')
@@ -181,13 +183,6 @@ async def setup_hook():
     logger.info(f'Private Channel Prefix: {PRIVATE_CHANNEL_PREFIX}')
     logger.info(f'Discord.py Version: {discord.__version__}')
     logger.info(f'-------------------------')
-    
-    # --- 注册视图 (如果需要持久化) ---
-    # view = CreateChatView() # 如果 CreateChatView 的 __init__ 设置了 timeout=None
-    # bot.add_view(view) # 这通常需要配合 message_id，逻辑较复杂，暂不实现
-    # logger.info("Persistent views (if any) registered.")
-    
-    # --- 同步斜杠命令 ---
     try:
         synced = await bot.tree.sync()
         logger.info(f"Synced {len(synced)} slash commands globally: {[c.name for c in synced]}")
@@ -200,38 +195,59 @@ async def on_ready():
     print(f"Logged in as {bot.user} ({bot.user.id})")
     print("Bot is ready.")
 
-
-# --- 新增：发送带按钮面板的命令 ---
+# --- 修改后的 setup_panel 命令 ---
 @bot.tree.command(name="setup_panel", description="发送一个包含'创建聊天'按钮的消息到当前频道")
-@app_commands.checks.has_permissions(manage_guild=True) # 限制管理员使用
+# --- 不再使用全局权限检查装饰器 ---
 async def setup_panel(interaction: discord.Interaction, message_content: str = "点击下面的按钮开始与 DeepSeek 的私密聊天："):
-    """发送包含创建聊天按钮的消息"""
-    try:
-        view = CreateChatView() # 创建一个新的视图实例
-        await interaction.channel.send(message_content, view=view)
-        await interaction.response.send_message("创建聊天按钮面板已发送！", ephemeral=True)
-        logger.info(f"User {interaction.user} deployed the create chat panel in channel {interaction.channel.id}")
-    except discord.Forbidden:
-         logger.error(f"Failed to send setup panel in {interaction.channel.id}: Missing permissions.")
-         await interaction.response.send_message("发送失败：机器人缺少在此频道发送消息或添加组件的权限。", ephemeral=True)
-    except Exception as e:
-        logger.exception(f"Failed to send setup panel in {interaction.channel.id}")
-        await interaction.response.send_message(f"发送面板时发生错误：{e}", ephemeral=True)
+    """发送包含创建聊天按钮的消息，根据频道类型检查权限"""
+    channel = interaction.channel
+    user = interaction.user # interaction.user 可能是 User 或 Member
 
-@setup_panel.error # 错误处理 for setup_panel
-async def setup_panel_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-     if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("你需要“管理服务器”权限才能使用此命令。", ephemeral=True)
-     else:
-        logger.error(f"Error in setup_panel command: {error}")
-        await interaction.response.send_message("执行命令时发生未知错误。", ephemeral=True)
+    # 检查命令是否在服务器频道中执行
+    if not interaction.guild:
+        await interaction.response.send_message("此命令只能在服务器频道中使用。", ephemeral=True)
+        return
 
+    # --- 条件权限检查 ---
+    is_private_chat_channel = isinstance(channel, discord.TextChannel) and channel.name.startswith(PRIVATE_CHANNEL_PREFIX)
+    can_execute = False
 
-# --- 斜杠命令：关闭聊天频道 (保持不变) ---
+    if is_private_chat_channel:
+        # 在私密频道中，任何可以发送交互的人都可以执行 (通常是创建者或管理员)
+        can_execute = True
+        logger.info(f"User {user} executing /setup_panel in private channel {channel.name}. Allowed.")
+    elif isinstance(user, discord.Member) and user.guild_permissions.manage_guild:
+        # 在其他频道，需要“管理服务器”权限
+        can_execute = True
+        logger.info(f"User {user} executing /setup_panel in public channel {channel.name}. Allowed (has manage_guild).")
+    else:
+        # 在其他频道且无权限
+        logger.warning(f"User {user} trying to execute /setup_panel in public channel {channel.name} without manage_guild permission. Denied.")
+        await interaction.response.send_message("你需要在非私密频道中使用此命令时拥有“管理服务器”权限。", ephemeral=True)
+        return # 阻止执行
+
+    # --- 如果权限检查通过 ---
+    if can_execute:
+        try:
+            view = CreateChatView()
+            await channel.send(message_content, view=view)
+            # 对原始交互进行响应
+            await interaction.response.send_message("创建聊天按钮面板已发送！", ephemeral=True)
+            logger.info(f"User {user} successfully deployed the create chat panel in channel {channel.id}")
+        except discord.Forbidden:
+             logger.error(f"Failed to send setup panel in {channel.id}: Missing permissions.")
+             # 尝试用 followup 回复错误（如果上面 response 成功）
+             try: await interaction.followup.send("发送失败：机器人缺少在此频道发送消息或添加组件的权限。", ephemeral=True)
+             except discord.NotFound: pass # 交互可能已超时
+        except Exception as e:
+            logger.exception(f"Failed to send setup panel in {channel.id}")
+            try: await interaction.followup.send(f"发送面板时发生错误：{e}", ephemeral=True)
+            except discord.NotFound: pass
+    # else 分支理论上不会执行，因为上面已经 return
+
+# --- 关闭聊天命令 (保持不变) ---
 @bot.tree.command(name="close_chat", description="关闭当前的 DeepSeek 私密聊天频道")
-@app_commands.checks.has_permissions(send_messages=True)
 async def close_chat(interaction: discord.Interaction):
-    # ... (此处省略，使用上一个版本完整的 close_chat 代码) ...
     channel = interaction.channel
     user = interaction.user
     if not isinstance(channel, discord.TextChannel) or not channel.name.startswith(PRIVATE_CHANNEL_PREFIX):
@@ -259,7 +275,6 @@ async def close_chat(interaction: discord.Interaction):
 # --- on_message 事件处理 (保持不变) ---
 @bot.event
 async def on_message(message: discord.Message):
-    # ... (此处省略，使用上一个版本完整的 on_message 代码) ...
     if message.author == bot.user or message.author.bot: return
     if not isinstance(message.channel, discord.TextChannel) or not message.channel.name.startswith(PRIVATE_CHANNEL_PREFIX): return
 
@@ -296,7 +311,6 @@ async def on_message(message: discord.Message):
               logger.warning(f"Response for channel {channel_id} is too long ({len(response_for_discord)} chars), splitting.")
               parts = []
               current_pos = 0
-              # ... (省略详细分割代码, 与上一版本相同) ...
               while current_pos < len(response_for_discord):
                     cut_off = min(current_pos + 1990, len(response_for_discord))
                     split_index = response_for_discord.rfind('\n', current_pos, cut_off)
@@ -321,6 +335,10 @@ async def on_message(message: discord.Message):
       else: # 未知错误
           logger.error(f"Received unexpected None values from API call for channel {channel_id}.")
           await message.channel.send("抱歉，与 DeepSeek API 通信时发生未知问题。")
+    except discord.Forbidden:
+         logger.warning(f"Missing permissions (Forbidden) to send message in channel {channel_id}.")
+    except discord.HTTPException as e:
+         logger.error(f"Failed to send message to channel {channel_id} due to HTTPException: {e}")
     except Exception as e:
         logger.exception(f"An error occurred in on_message handler for channel {channel_id}")
         try: await message.channel.send(f"处理你的消息时发生内部错误: {e}")
@@ -328,7 +346,6 @@ async def on_message(message: discord.Message):
 
 # --- 运行 Bot ---
 if __name__ == "__main__":
-    # ... (启动检查保持不变) ...
     if not DISCORD_BOT_TOKEN:
         logger.critical("错误：未找到 Discord Bot Token (环境变量 DISCORD_BOT_TOKEN)")
         exit("请设置 DISCORD_BOT_TOKEN 环境变量")
@@ -338,7 +355,7 @@ if __name__ == "__main__":
 
     try:
         logger.info("尝试启动 Discord 机器人 (commands.Bot)...")
-        bot.run(DISCORD_BOT_TOKEN, log_handler=None)
+        bot.run(DISCORD_BOT_TOKEN, log_handler=None) # 禁用 discord.py 默认日志，避免重复
     except discord.LoginFailure:
         logger.critical("Discord Bot Token 无效，登录失败。请检查你的 Token。")
     except discord.PrivilegedIntentsRequired as e:
