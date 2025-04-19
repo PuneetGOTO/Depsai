@@ -1,72 +1,44 @@
 # -*- coding: utf-8 -*-
 import discord
 from discord.ext import commands
-from discord import app_commands # 用于斜杠命令
-from discord.ui import View, Button, button # 用于按钮和视图
+from discord import app_commands
+from discord.ui import View, Button, button
 import os
 import aiohttp
 import json
 import logging
 from collections import deque
 import asyncio
-import re # 用于清理用户名
+import re
 
 # --- 提前设置日志记录 ---
-# 配置日志记录器，设定级别为 INFO，并指定格式
 logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
-# 获取当前模块的 logger 实例
 logger = logging.getLogger(__name__)
 
 # --- 配置 ---
-# 从环境变量获取敏感信息和配置
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions" # DeepSeek API 端点
-
-# --- 可用模型定义 ---
-# 包含模型ID、描述和是否支持视觉输入
-# !!重要!!: 请根据 DeepSeek 最新官方文档确认模型 ID 和 supports_vision 的准确性
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 AVAILABLE_MODELS = {
-    "deepseek-chat": {
-        "description": "通用对话模型，平衡性能和速度。",
-        "supports_vision": False, # 根据已知信息，当前 API 不支持
-    },
-    "deepseek-coder": {
-        "description": "代码生成和理解模型，专注于编程任务。",
-        "supports_vision": False,
-    },
-    "deepseek-reasoner": {
-        "description": "推理模型，擅长复杂逻辑、数学和思维链输出。",
-        "supports_vision": False,
-    },
+    "deepseek-chat": {"description": "通用对话模型，平衡性能和速度。", "supports_vision": False},
+    "deepseek-coder": {"description": "代码生成和理解模型。", "supports_vision": False},
+    "deepseek-reasoner": {"description": "推理模型，擅长复杂逻辑和思维链。", "supports_vision": False},
 }
-# --- 设置默认和当前模型 ---
-DEFAULT_MODEL_ID = "deepseek-chat" # 默认模型
-# 检查环境变量中的模型设置
+DEFAULT_MODEL_ID = "deepseek-chat"
 initial_model_id = os.getenv("DEEPSEEK_MODEL", DEFAULT_MODEL_ID)
-if initial_model_id not in AVAILABLE_MODELS:
-    logger.warning(f"环境指定的模型 '{initial_model_id}' 不在可用列表中，将使用默认模型 '{DEFAULT_MODEL_ID}'。")
-    initial_model_id = DEFAULT_MODEL_ID
-# 全局变量存储当前激活的模型ID
-current_model_id = initial_model_id
+current_model_id = initial_model_id if initial_model_id in AVAILABLE_MODELS else DEFAULT_MODEL_ID
 logger.info(f"Initializing with DeepSeek Model: {current_model_id} (Note: Current API is text-only)")
-
-# --- 其他配置 ---
-MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10")) # 总历史轮数
-SPLIT_MESSAGE_DELAY = float(os.getenv("SPLIT_MESSAGE_DELAY", "0.3")) # 分割消息延迟
-admin_ids_str = os.getenv("ADMIN_ROLE_IDS", "") # 管理员角色ID列表
+MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
+SPLIT_MESSAGE_DELAY = float(os.getenv("SPLIT_MESSAGE_DELAY", "0.3"))
+admin_ids_str = os.getenv("ADMIN_ROLE_IDS", "")
 ADMIN_ROLE_IDS = [int(role_id) for role_id in admin_ids_str.split(",") if role_id.strip().isdigit()]
-PRIVATE_CHANNEL_PREFIX = "deepseek-" # 私密频道前缀
-# MAX_IMAGE_ATTACHMENTS 变量已移除，因为不支持图片
+PRIVATE_CHANNEL_PREFIX = "deepseek-"
 
-# --- DeepSeek API 请求函数 (修正版，区分 Reasoner 的文本响应) ---
+# --- DeepSeek API 请求函数 (修正版，区分 Reasoner) ---
 async def get_deepseek_response(session, api_key, model, messages):
-    """异步调用 DeepSeek API，处理文本输入，特殊处理 reasoner 模型的思维链"""
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages} # 只发送文本消息
+    payload = {"model": model, "messages": messages}
     logger.info(f"Sending request to DeepSeek API using model '{model}' with {len(messages)} text messages.")
-    # logger.debug(f"Request payload: {json.dumps(payload, indent=2, ensure_ascii=False)}")
-
     try:
         async with session.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=300) as response:
             raw_response_text = await response.text()
@@ -77,15 +49,12 @@ async def get_deepseek_response(session, api_key, model, messages):
                  if response_data.get("choices") and len(response_data["choices"]) > 0:
                     message_data = response_data["choices"][0].get("message", {})
                     usage = response_data.get("usage")
-                    reasoning_content = None
-                    final_content = message_data.get("content")
+                    reasoning_content = None; final_content = message_data.get("content")
                     if model == "deepseek-reasoner": reasoning_content = message_data.get("reasoning_content")
-
                     full_response_for_discord = ""
                     if reasoning_content: full_response_for_discord += f"🤔 **思考过程:**\n```\n{reasoning_content.strip()}\n```\n\n"
                     if final_content: prefix = "💬 **最终回答:**\n" if reasoning_content else ""; full_response_for_discord += f"{prefix}{final_content.strip()}"
                     elif reasoning_content: full_response_for_discord = reasoning_content.strip(); logger.warning(f"Model '{model}' returned reasoning only.")
-
                     if not full_response_for_discord: logger.error("API response missing expected content."); return None, "API 返回数据不完整。"
                     logger.info(f"Success. Usage: {usage}")
                     return full_response_for_discord.strip(), final_content.strip() if final_content else None
@@ -101,45 +70,35 @@ async def get_deepseek_response(session, api_key, model, messages):
 
 # --- Discord 机器人设置 ---
 intents = discord.Intents.default()
-intents.messages = True
-intents.message_content = True
-intents.guilds = True
+intents.messages = True; intents.message_content = True; intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-# 对话历史
 conversation_history = {}
 
-# --- 创建按钮视图 (修改为持久化) ---
+# --- 创建按钮视图 (持久化) ---
 class CreateChatView(View):
-    # --- 修改：添加 __init__ 并设置 timeout=None ---
     def __init__(self):
-        super().__init__(timeout=None) # 设置为 None 使视图持久化
+        super().__init__(timeout=None)
 
-    # 按钮回调逻辑保持不变，但现在可以响应旧消息上的按钮点击了
     @button(label="创建私密聊天", style=discord.ButtonStyle.primary, emoji="💬", custom_id="create_deepseek_chat_button")
     async def create_chat_button_callback(self, interaction: discord.Interaction, button_obj: Button):
         guild = interaction.guild; user = interaction.user; bot_member = guild.get_member(bot.user.id) if guild else None
         if not guild or not bot_member: await interaction.response.send_message("无法获取服务器信息。", ephemeral=True); return
         if not bot_member.guild_permissions.manage_channels: await interaction.response.send_message("机器人缺少“管理频道”权限。", ephemeral=True); return
-
         clean_user_name = re.sub(r'[^\w-]', '', user.display_name.replace(' ', '-')).lower() or "user"
         channel_name = f"{PRIVATE_CHANNEL_PREFIX}{clean_user_name}-{user.id % 10000}"
-
         overwrites = { guild.default_role: discord.PermissionOverwrite(read_messages=False), user: discord.PermissionOverwrite(read_messages=True, send_messages=True, view_channel=True), bot_member: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_messages=True, manage_channels=True) }
         for role_id in ADMIN_ROLE_IDS: role = guild.get_role(role_id); overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_messages=True, view_channel=True) if role else None
-
         try:
             await interaction.response.send_message(f"正在创建频道 **{channel_name}** ...", ephemeral=True)
             category_name = "DeepSeek Chats"; category = discord.utils.find(lambda c: c.name.lower() == category_name.lower(), guild.categories)
             target_category = category if category and isinstance(category, discord.CategoryChannel) and category.permissions_for(bot_member).manage_channels else None
             new_channel = await guild.create_text_channel(channel_name, overwrites=overwrites, category=target_category)
             logger.info(f"Button Click: Created channel {new_channel.name} for user {user.name}")
-            # 欢迎消息显示当前模型
             await new_channel.send(f"你好 {user.mention}！\n欢迎来到 DeepSeek 私密聊天频道 (当前模型: **{current_model_id}**)。\n直接输入问题进行对话。\n历史最多保留 **{MAX_HISTORY // 2}** 轮。\n完成后可用 `/close_chat` 关闭。")
             await interaction.followup.send(f"频道已创建：{new_channel.mention}", ephemeral=True)
         except Exception as e: logger.exception(f"Button Click: Error creating channel for {user.id}"); await interaction.followup.send("创建频道时出错。", ephemeral=True)
 
-# --- setup_hook (修改：添加注册持久化视图) ---
+# --- setup_hook ---
 @bot.event
 async def setup_hook():
     logger.info("Running setup_hook...")
@@ -151,13 +110,9 @@ async def setup_hook():
     logger.info(f'Private Channel Prefix: {PRIVATE_CHANNEL_PREFIX}')
     logger.info(f'Discord.py Version: {discord.__version__}')
     logger.info(f'-------------------------')
-
-    # --- 修改：注册持久化视图 ---
-    # 这会告诉机器人，即使重启了，也要监听带有 CreateChatView 中定义的 custom_id 的组件交互
+    # --- 注册持久化视图 ---
     bot.add_view(CreateChatView())
     logger.info("Persistent CreateChatView registered.")
-    # --- 结束修改 ---
-
     try:
         synced = await bot.tree.sync()
         logger.info(f"Synced {len(synced)} slash commands globally: {[c.name for c in synced]}")
@@ -170,8 +125,7 @@ async def on_ready():
      print("Bot is ready and functional.")
 
 # --- 斜杠命令 ---
-
-# /setup_panel (逻辑不变，但现在发送的是持久化视图)
+# /setup_panel
 @bot.tree.command(name="setup_panel", description="发送一个包含'创建聊天'按钮的消息到当前频道")
 async def setup_panel(interaction: discord.Interaction, message_content: str = "点击下面的按钮开始与 DeepSeek 的私密聊天："):
     channel = interaction.channel; user = interaction.user
@@ -180,13 +134,8 @@ async def setup_panel(interaction: discord.Interaction, message_content: str = "
     can_execute = is_private or (isinstance(user, discord.Member) and user.guild_permissions.manage_guild)
     if not can_execute: await interaction.response.send_message("你需要在非私密频道中拥有“管理服务器”权限。", ephemeral=True); return
     try:
-        # 发送包含持久化视图的消息
-        view = CreateChatView()
-        await channel.send(message_content, view=view)
-        await interaction.response.send_message("按钮面板已发送！(按钮将保持有效)", ephemeral=True)
-        logger.info(f"User {user} successfully deployed the create chat panel in channel {channel.id}")
+        await channel.send(message_content, view=CreateChatView()); await interaction.response.send_message("按钮面板已发送！(按钮将保持有效)", ephemeral=True)
     except Exception as e: logger.exception(f"Failed setup panel in {channel.id}"); await interaction.response.send_message(f"发送面板出错: {e}", ephemeral=True)
-
 
 # /clear_history
 @bot.tree.command(name="clear_history", description="清除当前私密聊天频道的对话历史")
@@ -199,7 +148,6 @@ async def clear_history(interaction: discord.Interaction):
         except Exception as e: logger.exception(f"Error clearing history {channel_id}"); await interaction.response.send_message(f"清除历史出错: {e}", ephemeral=True)
     else: await interaction.response.send_message("未找到历史记录。", ephemeral=True)
 
-
 # /help
 @bot.tree.command(name="help", description="显示机器人使用帮助")
 async def help_command(interaction: discord.Interaction):
@@ -210,16 +158,14 @@ async def help_command(interaction: discord.Interaction):
     embed.set_footer(text=f"模型: {current_model_id}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-
 # /list_models
 @bot.tree.command(name="list_models", description="查看可用 DeepSeek 模型及当前激活模型")
 async def list_models(interaction: discord.Interaction):
-    embed = discord.Embed(title="可用 DeepSeek 模型", description=f"**当前激活模型:** `{current_model_id}` ✨\n*注意：根据当前信息，以下模型通过此 API 均不支持直接图片输入。*", color=discord.Color.green())
+    embed = discord.Embed(title="可用 DeepSeek 模型", description=f"**当前激活模型:** `{current_model_id}` ✨\n*注意：当前 API 均不支持直接图片输入。*", color=discord.Color.green())
     for model_id, info in AVAILABLE_MODELS.items():
         vision_support = "❌ 不支持视觉 (当前 API)"
         embed.add_field(name=f"`{model_id}`", value=f"{info['description']}\n*{vision_support}*", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
 
 # /set_model
 @bot.tree.command(name="set_model", description="[管理员] 切换机器人使用的 DeepSeek 模型")
@@ -241,8 +187,7 @@ async def set_model_error(interaction: discord.Interaction, error: app_commands.
      if isinstance(error, app_commands.MissingPermissions): await interaction.response.send_message("你需要“管理服务器”权限才能切换模型。", ephemeral=True)
      else: logger.error(f"Error in set_model: {error}"); await interaction.response.send_message("执行命令出错。", ephemeral=True)
 
-
-# /close_chat (使用修正后的代码)
+# /close_chat
 @bot.tree.command(name="close_chat", description="关闭当前的 DeepSeek 私密聊天频道")
 async def close_chat(interaction: discord.Interaction):
     channel = interaction.channel; user = interaction.user
@@ -250,7 +195,7 @@ async def close_chat(interaction: discord.Interaction):
     try:
         await interaction.response.send_message(f"频道将在几秒后关闭...", ephemeral=True)
         await channel.send(f"此频道由 {user.mention} 请求关闭，将在 5 秒后删除。")
-        channel_id = channel.id # 获取 ID
+        channel_id = channel.id
         if channel_id in conversation_history:
             try: del conversation_history[channel_id]; logger.info(f"Removed history for {channel_id}")
             except KeyError: logger.warning(f"History key {channel_id} already gone.")
@@ -259,19 +204,17 @@ async def close_chat(interaction: discord.Interaction):
         logger.info(f"Deleted channel {channel.name} ({channel.id})")
     except Exception as e: logger.exception(f"Error closing channel {channel.id}")
 
-
-# --- on_message 事件处理 (移除视觉处理) ---
+# --- on_message 事件处理 (修正后的最终版本) ---
 @bot.event
 async def on_message(message: discord.Message):
     """处理在私密频道中接收到的消息 (纯文本)"""
     if message.author == bot.user or message.author.bot: return
     if not isinstance(message.channel, discord.TextChannel) or not message.channel.name.startswith(PRIVATE_CHANNEL_PREFIX): return
-    if message.content.strip().startswith('/'): return # 忽略命令
+    if message.content.strip().startswith('/'): return
 
     channel_id = message.channel.id
     user_prompt_text = message.content.strip()
 
-    # 忽略附件
     if message.attachments: logger.info(f"Message in {channel_id} has attachments, ignoring them.")
     if not user_prompt_text: logger.debug(f"Ignoring message in {channel_id} with no text."); return
 
@@ -310,8 +253,16 @@ async def on_message(message: discord.Message):
                   await message.channel.send(part.strip())
       elif response_for_history: await message.channel.send(f"抱歉，处理请求时出错：\n{response_for_history}")
       else: logger.error(f"Unexpected None values from API call for channel {channel_id}."); await message.channel.send("抱歉，与 DeepSeek API 通信时未知问题。")
-    except Exception as e: logger.exception(f"Error in on_message handler for channel {channel_id}"); try: await message.channel.send(f"处理消息时内部错误: {e}")
-    except Exception: pass
+    # --- 修正后的 except 块 ---
+    except Exception as e: # 捕获 on_message 中的所有其他未预料的错误
+        logger.exception(f"An unexpected error occurred in on_message handler for channel {channel_id}")
+        try:
+            # 尝试在频道内发送错误提示
+            await message.channel.send(f"处理你的消息时发生内部错误，请稍后再试或联系管理员。错误：{e}")
+        except Exception as send_error:
+            # 如果连错误消息都发不出去，记录日志即可
+            logger.error(f"Could not send the internal error message to channel {channel_id} after primary error. Secondary error: {send_error}")
+            pass # Primary error already logged, nothing more to do here
 
 # --- 运行 Bot ---
 if __name__ == "__main__":
